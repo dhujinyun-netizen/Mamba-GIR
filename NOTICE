@@ -1,0 +1,17 @@
+Mamba-GIR third-party attribution
+
+mambagir/_mambavision.py contains architecture definitions extracted from
+the supplied MambaVision source, originally developed by NVIDIA Corporation.
+Upstream: https://github.com/NVlabs/MambaVision
+License: Nvidia Source Code License-NC; complete text is provided in
+licenses/NVIDIA-MambaVision.txt. Its research/evaluation-only use limitation
+continues to apply to the extracted architecture and derivative works.
+Original NVIDIA copyright and attribution notices are retained in the file.
+
+Local modifications: retain only the required architecture classes; remove
+model registration, automatic downloads and unused experimental factories;
+make attention dropout follow evaluation mode. The source remains compatible
+with the corresponding checkpoint parameter names.
+
+Datasets, pretrained MambaVision/Mamba weights, and third-party packages are
+not distributed here and retain their respective licenses.
