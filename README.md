@@ -1,10 +1,10 @@
 # Mamba-GIR
 
-Minimal research implementation of **Mamba-GIR: Structured Visual Conditioning and Identifier Modeling for Generative Image Retrieval**.
+Research implementation of **Mamba-GIR: Structured Visual Conditioning and Identifier Modeling for Generative Image Retrieval**.
 
 **Official splits → semantic tokenizer → residual vector quantization (RVQ) → fixed identifiers → CAVP-conditioned Mamba training → gallery retrieval.**
 
-This release contains source code, configuration and verification only. Dataset images, pretrained weights, trained checkpoints, run artifacts, manuscripts and review correspondence are not included.
+The repository provides source code, dataset split manifests, configurations, and commands for training and evaluation.
 
 ## Environment
 
@@ -17,9 +17,11 @@ python -m mambagir --help
 
 The MambaVision selective-scan dependency needs a compatible CUDA environment. RVQ uses PyTorch; FAISS and PEFT are not required. Main defaults are in configs/paper.json.
 
-Obtain pretrained weights separately. Supply a checkpoint matching the default MambaVision L-21K architecture and a local Hugging Face MambaModel directory. See the [upstream MambaVision project](https://github.com/NVlabs/MambaVision). The decoder checkpoint name is not the total retrieval-model parameter count; the code reports actual total and trainable parameters. With the locally verified L-21K encoder and mamba-790m decoder, the CUB 200-class model has 1,064,165,948 total and 44,569,676 trainable parameters. That example is an executable main-method reference, not an archived instance of the reported 790M full-model configuration.
+Supply a checkpoint matching the selected MambaVision architecture and a local Hugging Face MambaModel directory. The default encoder is MambaVision L-21K; see the [upstream MambaVision project](https://github.com/NVlabs/MambaVision). Full-model parameter counts include the visual encoder, decoder, conditioning modules, and prediction heads. Each run records its configuration and actual total/trainable parameter counts.
 
 ## 1. Prepare official splits
+
+Processed split manifests for the four benchmarks are in [manifests/](manifests/README.md). Each file specifies image paths, labels, training targets, gallery row indices, and queries. The following commands generate manifests for your local dataset layout:
 
 ~~~bash
 python -m mambagir prepare-data --dataset cub --root /datasets/CUB_200_2011 --output data/cub.json
@@ -62,7 +64,7 @@ python -m mambagir train \
 
 The frozen encoder supplies 49 patches. CAVP produces 4 prompts per RVQ stage. Codebook memories enter both prompt refinement and the stage-aware head. Trainable components are CAVP, the head, the auxiliary classifier and rank-8 LoRA adapters in x_proj, in_proj, out_proj and embeddings. Same-label targets are sampled independently for every source per epoch, excluding self when another positive exists.
 
-Generator artifacts bind to the exact tokenizer UUID. last.pt is the final scheduled checkpoint; best.pt is chosen by training loss without query-set selection. Adapter-enabled Mamba uses an unfused forward path to preserve LoRA; decoding currently recomputes the prefix without incremental caching.
+Generator artifacts bind to the tokenizer used during training. last.pt is the final scheduled checkpoint; best.pt is chosen by training loss. Adapter-enabled Mamba uses an unfused forward path to preserve LoRA; decoding processes the prefix and generated history at each step.
 
 ## 4. Evaluate
 
@@ -76,7 +78,30 @@ python -m mambagir evaluate \
 
 Unconstrained beam search produces raw keys. Gallery resolution removes invalid keys, then expands every distinct valid key in fixed gallery-manifest order without image reranking. Outputs: metrics.json and predictions.pt.
 
-Image Recall@K, raw-key Hit@K/MRR, validity, query reuse, gallery collisions and a within-bucket oracle are separate metrics. The oracle is an upper-bound ordering diagnostic, not a trained reranker.
+The report includes image Recall@K, raw-key Hit@K/MRR, validity, query reuse, gallery collisions, and a within-bucket ordering diagnostic. Raw-key Hit@K/MRR retain invalid candidates at their original beam positions. A key is relevant when at least one of its gallery members has the query label; MRR assigns zero when no relevant key occurs in the beam.
+
+Export aggregate raw-ranking metrics and the candidate-level records from a saved evaluation:
+
+~~~bash
+python -m mambagir.diagnostics \
+  --predictions runs/cub/seed3407/evaluation/predictions.pt \
+  --tokenizer runs/cub/seed3407/tokenizer/tokenizer.pt \
+  --manifest data/cub.json \
+  --output-dir runs/cub/seed3407/evaluation/diagnostics
+~~~
+
+Measure query latency and peak GPU memory for a trained configuration:
+
+~~~bash
+python -m mambagir.benchmark \
+  --checkpoint runs/cub/seed3407/generator/last.pt \
+  --manifest data/cub.json \
+  --output runs/cub/seed3407/timing.json \
+  --device cuda:0 --batch-size 1 --beam-size 8 \
+  --warmup 20 --iterations 100
+~~~
+
+Timing covers a resident query batch through visual encoding, conditioning, beam decoding, and gallery resolution. The JSON report records the GPU, precision, warm-up and measured iterations, CUDA-synchronized latency samples, and peak allocated/reserved GPU memory. Image preprocessing and input transfer precede the timed interval.
 
 ## 5. Export manifests and identifier mappings
 
@@ -112,10 +137,12 @@ The script provides a four-dataset, three-seed command plan. Its default prints 
 | mambagir/retrieval.py | Beam search, gallery resolution and metrics |
 | mambagir/runtime.py, __main__.py | Training, evaluation and artifacts |
 | mambagir/reproduction.py | Portable manifests and key mappings |
+| mambagir/diagnostics.py | Saved raw candidates and ranking diagnostics |
+| mambagir/benchmark.py | Query latency and GPU memory measurements |
 
-Generic patch controls use a shared prompt mean in the prediction/alignment paths; level-wise controls use the matching stage mean. Full CAVP remains stage-aware. The no_code_memory control removes both prompt code attention and RVQ vectors from head/alignment memory. These explicit reference definitions do not constitute independently rerun historical ablations.
+Generic patch controls use a shared prompt mean in the prediction/alignment paths; level-wise controls use the matching stage mean. Full CAVP remains stage-aware. The no_code_memory control removes both prompt code attention and RVQ vectors from head/alignment memory.
 
-## Verification and result provenance
+## Verification
 
 ~~~bash
 PYTHONDONTWRITEBYTECODE=1 USE_TF=0 MKL_THREADING_LAYER=GNU \
@@ -123,8 +150,6 @@ PYTHONDONTWRITEBYTECODE=1 USE_TF=0 MKL_THREADING_LAYER=GNU \
 ~~~
 
 Tests cover formulas, active LoRA gradients, causality, data roles, tokenizer identity, beam ancestry, invalid raw positions, collision ordering and a small training-to-retrieval path. Full pretrained integration is opt-in via MAMBAGIR_ENCODER_CHECKPOINT and MAMBAGIR_DECODER_PATH.
-
-The minimal release supplies the main-method reproduction path. Published benchmark values remain the authors' reported results; unit tests and synthetic smoke runs do not regenerate those accuracy values. External baseline implementations and archived experiment artifacts are not bundled.
 
 ## License
 
