@@ -22,7 +22,7 @@ import torch
 
 from . import runtime
 from .data import ImageDataset, Manifest
-from .retrieval import GalleryIndex, beam_search
+from .retrieval import CUDAGraphBeamSearch, GalleryIndex, beam_search
 
 
 def _validate_settings(warmup, iterations, batch_size, beam_size):
@@ -33,7 +33,7 @@ def _validate_settings(warmup, iterations, batch_size, beam_size):
 
 
 def measure_retrieval(model, images, gallery, beam_size=8, warmup=5, iterations=20,
-                      *, batch_size=None, topk=None, amp=False):
+                      *, batch_size=None, topk=None, amp=False, cuda_graph=False):
     """Measure a preloaded model and query batch; leave tensors and mode intact.
 
     Each sample covers beam_search, generated-key device-to-host transfer, and
@@ -54,9 +54,12 @@ def measure_retrieval(model, images, gallery, beam_size=8, warmup=5, iterations=
     device = images.device
     if device.type not in {'cpu', 'cuda'}:
         raise ValueError('benchmark device must be cpu or cuda')
+    if cuda_graph and device.type != 'cuda':
+        raise ValueError('CUDA graph timing requires a CUDA device')
     if any(value.device != device for value in chain(model.parameters(), model.buffers())):
         raise ValueError('model and query batch must already reside on the same device')
     autocast_enabled = bool(amp and device.type == 'cuda')
+    runner = None
 
     def synchronize():
         if device.type == 'cuda':
@@ -64,7 +67,7 @@ def measure_retrieval(model, images, gallery, beam_size=8, warmup=5, iterations=
 
     def retrieve():
         with torch.inference_mode(), torch.autocast(device.type, enabled=autocast_enabled):
-            keys, _ = beam_search(model, images, beam_size)
+            keys, _ = runner(images) if runner is not None else beam_search(model, images, beam_size)
         return gallery.resolve(keys, topk), keys.shape[1]
 
     was_training = model.training
@@ -72,6 +75,8 @@ def measure_retrieval(model, images, gallery, beam_size=8, warmup=5, iterations=
     memory = None
     samples = []
     try:
+        if cuda_graph:
+            runner = CUDAGraphBeamSearch(model, images, beam_size, amp=autocast_enabled)
         for _ in range(warmup):
             retrieve()
         synchronize()
@@ -127,6 +132,8 @@ def measure_retrieval(model, images, gallery, beam_size=8, warmup=5, iterations=
         'conditioning': conditioning, 'model_class': type(model).__name__,
         'cached_decoding': bool(getattr(model, 'supports_cached_decoding', False)),
         'lora_merged_for_inference': bool(getattr(getattr(model, 'decoder', None), 'inference_merged', False)),
+        'cuda_graph': bool(cuda_graph),
+        'cuda_graph_setup_ms': runner.setup_ms if runner is not None else None,
         'num_gallery': len(gallery.codes), 'image_shape': list(images.shape),
         'parameter_counts': runtime.parameter_counts(model), 'batch_latency_ms': latency,
         'amortized_per_query_ms': {name: latency[name] / batch_size for name in ('mean', 'median', 'p95')},
@@ -146,7 +153,7 @@ def measure_retrieval(model, images, gallery, beam_size=8, warmup=5, iterations=
 
 def benchmark_checkpoint(checkpoint_path, manifest_path, output, device='cuda', *,
                          tokenizer_path=None, decoder_path=None, warmup=5, iterations=20,
-                         batch_size=1, beam_size=None):
+                         batch_size=1, beam_size=None, cuda_graph=False):
     """Load a clean artifact and time the first requested batch, without training."""
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
     if checkpoint.get('kind') != 'mambagir_generator' or checkpoint.get('format_version') != 1:
@@ -177,7 +184,8 @@ def benchmark_checkpoint(checkpoint_path, manifest_path, output, device='cuda', 
     images = torch.stack([dataset[index]['image'] for index in range(batch_size)]).to(device)
     gallery = GalleryIndex(tokenizer['target_codes'][manifest.gallery_indices])
     report = measure_retrieval(model, images, gallery, beam_size, warmup, iterations,
-                               batch_size=batch_size, topk=max(config['evaluation']['ks']), amp=config['amp'])
+                               batch_size=batch_size, topk=max(config['evaluation']['ks']), amp=config['amp'],
+                               cuda_graph=cuda_graph)
     report.update(checkpoint=str(Path(checkpoint_path).expanduser().resolve()),
                   parameter_counts=restored_parameter_counts,
                   inference_parameter_counts=runtime.parameter_counts(model),
@@ -203,6 +211,7 @@ def main(argv=None):
     parser.add_argument('--iterations', type=int, default=20)
     parser.add_argument('--batch-size', type=int, default=1)
     parser.add_argument('--beam-size', type=int)
+    parser.add_argument('--cuda-graph', action='store_true', help='capture Mamba inference before timing')
     arguments = vars(parser.parse_args(argv))
     arguments['checkpoint_path'] = arguments.pop('checkpoint')
     arguments['manifest_path'] = arguments.pop('manifest')

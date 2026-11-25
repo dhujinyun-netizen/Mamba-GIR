@@ -112,6 +112,23 @@ class ModelTests(unittest.TestCase):
         books.zero_()
         self.assertGreater(model.codebooks.abs().sum().item(), 0)
 
+    def test_fixed_conditioning_matches_query_dependent_path_for_all_variants(self):
+        for conditioning in model_module.CONDITIONING_MODES:
+            with self.subTest(conditioning=conditioning):
+                model = self.make_model(conditioning=conditioning).eval()
+                self.assertTrue(callable(getattr(model, 'cache_conditioning', None)))
+                cache = model.cache_conditioning()
+                for batch in (1, 3):
+                    images = torch.randn(batch, 49, 8)
+                    with torch.no_grad():
+                        expected_prompts, expected_memory = model.encode(images)
+                        prompts, memory = model.encode(images, conditioning_cache=cache)
+                    torch.testing.assert_close(prompts, expected_prompts)
+                    torch.testing.assert_close(memory, expected_memory, rtol=0, atol=0)
+                model.train()
+                with self.assertRaisesRegex(ValueError, 'eval|inference'):
+                    model.encode(images, conditioning_cache=cache)
+
     def test_next_logits_matches_normalized_memory_head(self):
         decoder = CumulativeDecoder(2, 5)
         model = model_module.MambaGIR(PatchEncoder(2), decoder, torch.randn(2, 2, 2),

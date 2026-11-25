@@ -78,6 +78,8 @@ python -m mambagir evaluate \
 
 Evaluation restores the adapters and merges them into the decoder weights for inference. Mamba processes the visual prefix and SOS once, then carries convolution and SSM states while consuming one new token per step. Beam selection reorders and duplicates both state types with their parent hypotheses. The Python API supports `beam_search(..., use_cache=False)` for comparison with full-prefix decoding.
 
+Add `--cuda-graph` to CUDA evaluation to replay the complete encoding and beam-search computation with fixed tensor shapes. The runner precomputes the fixed codebook memory and its attention K/V projections once. Each query still computes its own visual features, prompts and decoder states. A smaller final evaluation batch uses the cached eager path. The Python `CUDAGraphBeamSearch(model, example_images, beam_size=8, amp=False)` interface provides the same reusable runner after `model.prepare_for_inference()`; create a new runner after changing model weights, precision or input shape.
+
 Unconstrained beam search produces raw keys. Gallery resolution removes invalid keys, then expands every distinct valid key in fixed gallery-manifest order without image reranking. Outputs: metrics.json and predictions.pt.
 
 The report includes image Recall@K, raw-key Hit@K/MRR, validity, query reuse, gallery collisions, and a within-bucket ordering diagnostic. Raw-key Hit@K/MRR retain invalid candidates at their original beam positions. A key is relevant when at least one of its gallery members has the query label; MRR assigns zero when no relevant key occurs in the beam.
@@ -104,6 +106,8 @@ python -m mambagir.benchmark \
 ~~~
 
 Timing covers a resident query batch through visual encoding, conditioning, beam decoding, and gallery resolution. The JSON report records the GPU, precision, warm-up and measured iterations, CUDA-synchronized latency samples, and peak allocated/reserved GPU memory. Image preprocessing and input transfer precede the timed interval.
+
+The benchmark also accepts `--cuda-graph`. Graph preparation occurs once before timed queries and is reported separately as `cuda_graph_setup_ms`; query latency includes input-buffer copying, graph replay, and gallery resolution. Both evaluation and timing retain the checkpoint configuration's autocast setting.
 
 ## 5. Export a retrieval index
 

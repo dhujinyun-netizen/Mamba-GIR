@@ -180,11 +180,21 @@ class MambaDecoder(nn.Module):
     def prefill(self, inputs_embeds: Tensor):
         """Process the visual prefix and SOS once and return their Mamba state."""
         from transformers.cache_utils import MambaCache
+        class PrefillCache(MambaCache):
+            def update_conv_state(self, layer_idx, new_conv_state, cache_position):
+                state = self.conv_states[layer_idx]
+                if cache_position.shape[0] == state.shape[-1]:
+                    # Prefill writes every slot in order. A direct copy avoids
+                    # HF's CPU-indexed CUDA write, which prevents graph capture.
+                    state.copy_(new_conv_state.to(device=state.device, dtype=state.dtype))
+                    return state
+                return super().update_conv_state(layer_idx, new_conv_state, cache_position)
+
         dtype = (torch.get_autocast_gpu_dtype()
                  if inputs_embeds.device.type == 'cuda' and torch.is_autocast_enabled()
                  else inputs_embeds.dtype)
-        cache = MambaCache(self.backbone.config, inputs_embeds.shape[0],
-                           device=inputs_embeds.device, dtype=dtype)
+        cache = PrefillCache(self.backbone.config, inputs_embeds.shape[0],
+                             device=inputs_embeds.device, dtype=dtype)
         # HF 4.53 uses this tiny position tensor for Python control flow. CPU
         # positions avoid a GPU-to-CPU synchronization in each decoder layer.
         position = torch.arange(self.backbone.config.conv_kernel, device='cpu')

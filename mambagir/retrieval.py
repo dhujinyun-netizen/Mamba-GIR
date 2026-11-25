@@ -1,6 +1,8 @@
 """Paper Sec. III-B/III-D and VI-A: raw key generation, resolution and metrics."""
 
 from collections import Counter, defaultdict
+from itertools import chain
+import time
 from typing import Iterable
 
 import torch
@@ -10,7 +12,7 @@ from torch.nn import functional as F
 
 @torch.no_grad()
 def beam_search(model, images: Tensor, beam_size: int = 8, *,
-                use_cache: bool = True) -> tuple[Tensor, Tensor]:
+                use_cache: bool = True, conditioning_cache=None) -> tuple[Tensor, Tensor]:
     """Generate unconstrained fixed-length keys, ranked by summed log probability.
 
     Returns keys [B, K, L] and log scores [B, K]. Gallery validity is deliberately
@@ -21,7 +23,8 @@ def beam_search(model, images: Tensor, beam_size: int = 8, *,
     """
     if beam_size < 1:
         raise ValueError('beam_size must be positive')
-    prompts, memory = model.encode(images)
+    prompts, memory = (model.encode(images) if conditioning_cache is None else
+                       model.encode(images, conditioning_cache=conditioning_cache))
     batch = images.shape[0]
     keys = torch.empty(batch, 1, 0, dtype=torch.long, device=images.device)
     scores = torch.zeros(batch, 1, device=images.device)
@@ -50,6 +53,61 @@ def beam_search(model, images: Tensor, beam_size: int = 8, *,
             offsets = torch.arange(batch, device=parents.device)[:, None] * width
             model.reorder_cache(cache, (parents + offsets).flatten())
     return keys, scores
+
+
+class CUDAGraphBeamSearch:
+    """Replay fixed-shape Mamba retrieval after ``prepare_for_inference()``.
+
+    The graph includes encoding, CAVP and all beam steps. Gallery resolution
+    remains outside. Construct after loading/moving the model and call serially
+    with the captured input shape, device and dtype. Recreate the runner after
+    changing weights, precision or the beam budget. Returned tensors own their
+    storage, so subsequent queries do not overwrite earlier predictions.
+    """
+
+    @torch.inference_mode()
+    def __init__(self, model, example_images: Tensor, beam_size: int = 8, *,
+                 amp: bool = False, warmup: int = 3):
+        if example_images.device.type != 'cuda':
+            raise ValueError('CUDA graph inference requires CUDA query tensors')
+        if (model.training or not getattr(model, 'supports_cached_decoding', False)
+                or not getattr(getattr(model, 'decoder', None), 'inference_merged', False)):
+            raise ValueError('call model.prepare_for_inference() before CUDA graph capture')
+        if beam_size < 1 or warmup < 1:
+            raise ValueError('beam_size and graph warmup must be positive')
+        if not example_images.is_floating_point() or not example_images.numel():
+            raise ValueError('query tensors must be nonempty floating tensors')
+        if any(t.device != example_images.device for t in chain(model.parameters(), model.buffers())):
+            raise ValueError('model and query tensors must use the same CUDA device')
+        self.model = model
+        self.beam_size = beam_size
+        self.amp = amp
+        self.images = example_images.clone()
+        started = time.perf_counter()
+        with torch.cuda.device(example_images.device), torch.autocast('cuda', enabled=amp, cache_enabled=False):
+            self.conditioning_cache = model.cache_conditioning()
+            stream = torch.cuda.Stream(device=example_images.device)
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(warmup):
+                    beam_search(model, self.images, beam_size, conditioning_cache=self.conditioning_cache)
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize(example_images.device)
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph, stream=stream):
+                self.keys, self.scores = beam_search(model, self.images, beam_size,
+                                                    conditioning_cache=self.conditioning_cache)
+            torch.cuda.synchronize(example_images.device)
+        self.setup_ms = (time.perf_counter() - started) * 1000
+
+    @torch.inference_mode()
+    def __call__(self, images: Tensor) -> tuple[Tensor, Tensor]:
+        if (images.shape != self.images.shape or images.dtype != self.images.dtype
+                or images.device != self.images.device):
+            raise ValueError('CUDA replay requires the captured input shape, dtype and device')
+        self.images.copy_(images)
+        self.graph.replay()
+        return self.keys.clone(), self.scores.clone()
 
 
 class GalleryIndex:

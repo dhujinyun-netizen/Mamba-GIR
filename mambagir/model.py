@@ -74,7 +74,33 @@ class CAVP(nn.Module):
             self.ffn = nn.Sequential(nn.Linear(d_model, hidden), nn.GELU(), nn.Dropout(dropout),
                                      nn.Linear(hidden, d_model), nn.Dropout(dropout))
 
-    def forward(self, patches: Tensor, memory: Tensor) -> Tensor:
+    def project_code_memory(self, memory: Tensor) -> tuple[Tensor, Tensor]:
+        """Query-independent K/V projections for eval-mode codebook attention."""
+        attention = self.code_attention
+        bias = attention.in_proj_bias
+        projected = F.linear(memory, attention.in_proj_weight[self.d_model:],
+                             None if bias is None else bias[self.d_model:])
+        heads = attention.num_heads
+        return tuple(part.reshape(self.levels, self.codebook_size, heads, self.d_model // heads)
+                     .transpose(1, 2).contiguous() for part in projected.chunk(2, dim=-1))
+
+    def _cached_code_attention(self, query: Tensor, code_kv: tuple[Tensor, Tensor]) -> Tensor:
+        attention = self.code_attention
+        count, length, _ = query.shape
+        heads = attention.num_heads
+        bias = attention.in_proj_bias
+        projected = F.linear(query, attention.in_proj_weight[:self.d_model],
+                             None if bias is None else bias[:self.d_model])
+        projected = projected.reshape(count, length, heads, self.d_model // heads).transpose(1, 2)
+        keys, values = [part[None].expand(count // self.levels, -1, -1, -1, -1)
+                        .reshape(count, heads, self.codebook_size, self.d_model // heads)
+                        for part in code_kv]
+        attended = F.scaled_dot_product_attention(projected, keys, values)
+        attended = attended.transpose(1, 2).contiguous().reshape(count, length, self.d_model)
+        return attention.out_proj(attended)
+
+    def forward(self, patches: Tensor, memory: Tensor,
+                code_kv: tuple[Tensor, Tensor] | None = None) -> Tensor:
         if patches.ndim != 3 or patches.shape[1:] != (49, self.visual_dim):
             raise ValueError(f"patches must have shape [B, 49, {self.visual_dim}]")
         if tuple(memory.shape) != (self.levels, self.codebook_size, self.d_model):
@@ -100,9 +126,14 @@ class CAVP(nn.Module):
             evidence = query + self.patch_attention(query, patches_by_level, patches_by_level, need_weights=False)[0]
             evidence = evidence.reshape(batch, self.levels, self.queries_per_level, self.d_model)
             if self.conditioning == "cavp":
-                stage_memory = memory[None].expand(batch, -1, -1, -1).reshape(-1, self.codebook_size, self.d_model)
-                attended = self.code_attention(evidence.reshape(-1, self.queries_per_level, self.d_model),
-                                                stage_memory, stage_memory, need_weights=False)[0]
+                query = evidence.reshape(-1, self.queries_per_level, self.d_model)
+                if code_kv is None:
+                    stage_memory = memory[None].expand(batch, -1, -1, -1).reshape(-1, self.codebook_size, self.d_model)
+                    attended = self.code_attention(query, stage_memory, stage_memory, need_weights=False)[0]
+                else:
+                    if self.training:
+                        raise ValueError('cached codebook attention is for inference in eval mode')
+                    attended = self._cached_code_attention(query, code_kv)
                 evidence = evidence + self.gamma[None, :, None, None] * attended.reshape_as(evidence)
         # Equation (cavp) has no residual around the FFN.
         return self.ffn(self.norm(evidence))
@@ -173,14 +204,33 @@ class MambaGIR(nn.Module):
             merge()
         return self
 
-    def encode(self, images: Tensor) -> tuple[Tensor, Tensor]:
-        with torch.no_grad():
-            patches = self.encoder.forward_patches(images)
+    def _code_memory(self) -> Tensor:
         stage_ids = torch.arange(self.sos_id, device=self.codebooks.device).reshape(self.levels, self.codebook_size)
         memory = self.decoder.embed_tokens(stage_ids)
         if self.conditioning != "no_code_memory":
             memory = self.memory_projection(self.memory_norm(self.codebooks)) + memory
-        return self.cavp(patches, memory), memory
+        return memory
+
+    @torch.no_grad()
+    def cache_conditioning(self):
+        """Prepare fixed memory/K/V after loading weights, under inference precision.
+
+        Keep this cache with the inference runner and rebuild it after changing
+        weights, device or precision. It contains no query-dependent tensors.
+        """
+        if self.training:
+            raise ValueError('conditioning caches require eval mode')
+        memory = self._code_memory()
+        code_kv = self.cavp.project_code_memory(memory) if self.conditioning == 'cavp' else None
+        return memory, code_kv
+
+    def encode(self, images: Tensor, *, conditioning_cache=None) -> tuple[Tensor, Tensor]:
+        if conditioning_cache is not None and self.training:
+            raise ValueError('conditioning caches are for inference in eval mode')
+        with torch.no_grad():
+            patches = self.encoder.forward_patches(images)
+        memory, code_kv = (self._code_memory(), None) if conditioning_cache is None else conditioning_cache
+        return self.cavp(patches, memory, code_kv), memory
 
     def _validate_codes(self, codes: Tensor, batch: int, *, complete: bool) -> None:
         if codes.dtype != torch.long:

@@ -12,7 +12,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from .data import ImageDataset, Manifest, sample_positive_indices
-from .retrieval import GalleryIndex, beam_search, retrieval_report
+from .retrieval import CUDAGraphBeamSearch, GalleryIndex, beam_search, retrieval_report
 from .rvq import ResidualVectorQuantizer
 from .tokenizer import SemanticTokenizer
 from .vision import VisualEncoder
@@ -287,8 +287,10 @@ def train_generator(config, manifest_path, tokenizer_path, output_dir, device='c
 
 @torch.no_grad()
 def evaluate(checkpoint_path, manifest_path, output_dir, device='cuda', *,
-             beam_size=None, ks=None, tokenizer_path=None, decoder_path=None):
+             beam_size=None, ks=None, tokenizer_path=None, decoder_path=None, cuda_graph=False):
     device = torch.device(device)
+    if cuda_graph and device.type != 'cuda':
+        raise ValueError('CUDA graph evaluation requires a CUDA device')
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
     if checkpoint.get('kind') != 'mambagir_generator' or checkpoint.get('format_version') != 1:
         raise ValueError('expected a clean-version generator checkpoint')
@@ -314,9 +316,18 @@ def evaluate(checkpoint_path, manifest_path, output_dir, device='cuda', *,
     gallery = GalleryIndex(tokenizer['target_codes'][manifest.gallery_indices])
     all_keys, all_scores = [], []
     amp = config['amp'] and device.type == 'cuda'
+    runner, graph_queries = None, 0
     for batch in loader:
+        images = batch['image'].to(device)
+        if cuda_graph and runner is None:
+            runner = CUDAGraphBeamSearch(model, images, beam_size, amp=amp)
         with torch.cuda.amp.autocast(enabled=amp):
-            keys, scores = beam_search(model, batch['image'].to(device), beam_size)
+            if runner is not None and images.shape == runner.images.shape:
+                keys, scores = runner(images)
+                graph_queries += len(images)
+            else:
+                # A smaller final batch uses the same cached eager decoder.
+                keys, scores = beam_search(model, images, beam_size)
         all_keys.append(keys.cpu())
         all_scores.append(scores.cpu())
     keys, scores = torch.cat(all_keys), torch.cat(all_scores)
@@ -326,7 +337,8 @@ def evaluate(checkpoint_path, manifest_path, output_dir, device='cuda', *,
     report.update(seed=config['seed'], checkpoint=str(Path(checkpoint_path).resolve()),
                   checkpoint_epoch=checkpoint['epoch'], parameter_counts=restored_parameter_counts,
                   inference_parameter_counts=parameter_counts(model),
-                  cached_decoding=model.supports_cached_decoding)
+                  cached_decoding=model.supports_cached_decoding,
+                  cuda_graph=bool(cuda_graph), cuda_graph_queries=graph_queries)
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / 'metrics.json').write_text(json.dumps(report, indent=2, ensure_ascii=False) + '\n')

@@ -35,6 +35,7 @@ def main(argv=None):
     test.add_argument('--output', required=True)
     test.add_argument('--device', default='cuda:0')
     test.add_argument('--beam-size', type=int)
+    test.add_argument('--cuda-graph', action='store_true', help='replay fixed-shape Mamba inference on CUDA')
     test.add_argument('--ks', nargs='+', type=int)
     test.add_argument('--tokenizer', help='override tokenizer artifact path if moved')
     test.add_argument('--mamba-model', help='override pretrained decoder path if moved')
@@ -77,7 +78,8 @@ def main(argv=None):
         print(f'Saved: {result}')
     elif args.command == 'evaluate':
         evaluate(args.checkpoint, args.manifest, args.output, args.device, beam_size=args.beam_size,
-                 ks=args.ks, tokenizer_path=args.tokenizer, decoder_path=args.mamba_model)
+                 ks=args.ks, tokenizer_path=args.tokenizer, decoder_path=args.mamba_model,
+                 cuda_graph=args.cuda_graph)
     elif args.command == 'summarize':
         result = json.dumps(summarize_reports(args.reports), indent=2)
         print(result)
