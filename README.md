@@ -15,7 +15,7 @@ python -m pip install -r requirements.txt
 python -m mambagir --help
 ~~~
 
-The MambaVision selective-scan dependency needs a compatible CUDA environment. RVQ uses PyTorch; FAISS and PEFT are not required. Main defaults are in configs/paper.json.
+The MambaVision selective-scan dependency needs a compatible CUDA environment. RVQ and LoRA modules are implemented in PyTorch. Main defaults are in configs/paper.json.
 
 Supply a checkpoint matching the selected MambaVision architecture and a local Hugging Face MambaModel directory. The default encoder is MambaVision L-21K; see the [upstream MambaVision project](https://github.com/NVlabs/MambaVision). Full-model parameter counts include the visual encoder, decoder, conditioning modules, and prediction heads. Each run records its configuration and actual total/trainable parameter counts.
 
@@ -103,7 +103,9 @@ python -m mambagir.benchmark \
 
 Timing covers a resident query batch through visual encoding, conditioning, beam decoding, and gallery resolution. The JSON report records the GPU, precision, warm-up and measured iterations, CUDA-synchronized latency samples, and peak allocated/reserved GPU memory. Image preprocessing and input transfer precede the timed interval.
 
-## 5. Export manifests and identifier mappings
+## 5. Export a retrieval index
+
+Export the gallery lookup and dataset manifest for a trained tokenizer with:
 
 ~~~bash
 python -m mambagir.reproduction export \
@@ -113,7 +115,7 @@ python -m mambagir.reproduction export \
   --output runs/cub/seed3407/export
 ~~~
 
-The export contains a relative manifest, every identifier's ordered gallery members, and configuration/tokenizer provenance; no images or weights. For relocation, see:
+The export contains relative image paths, ordered gallery members for each identifier, and the tokenizer configuration. The reproduction script provides commands for all four datasets:
 
 ~~~bash
 python -m mambagir.reproduction --help
