@@ -4,7 +4,7 @@ Research implementation of **Mamba-GIR: Structured Visual Conditioning and Ident
 
 **Official splits → semantic tokenizer → residual vector quantization (RVQ) → fixed identifiers → CAVP-conditioned Mamba training → gallery retrieval.**
 
-The repository provides source code, dataset split manifests, configurations, and commands for training and evaluation.
+The repository provides source code, dataset split manifests, identifier-to-image mappings, configurations, and commands for training and evaluation.
 
 ## Environment
 
@@ -110,6 +110,8 @@ Timing covers a resident query batch through visual encoding, conditioning, beam
 The benchmark also accepts `--cuda-graph`. Graph preparation occurs once before timed queries and is reported separately as `cuda_graph_setup_ms`; query latency includes input-buffer copying, graph replay, and gallery resolution. Both evaluation and timing retain the checkpoint configuration's autocast setting.
 
 ## 5. Export a retrieval index
+
+Released gallery mappings for all four benchmarks are available in [identifiers/](identifiers/README.md), paired with the corresponding [split manifests](manifests/README.md). Each mapping contains the four-symbol identifier and every gallery image assigned to it, including the image path, label, target row, and gallery row. Members of a shared identifier retain their gallery order. Use each assignment with the generator trained on those identifiers.
 
 Export the gallery lookup and dataset manifest for a trained tokenizer with:
 
