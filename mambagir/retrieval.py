@@ -9,12 +9,15 @@ from torch.nn import functional as F
 
 
 @torch.no_grad()
-def beam_search(model, images: Tensor, beam_size: int = 8) -> tuple[Tensor, Tensor]:
+def beam_search(model, images: Tensor, beam_size: int = 8, *,
+                use_cache: bool = True) -> tuple[Tensor, Tensor]:
     """Generate unconstrained fixed-length keys, ranked by summed log probability.
 
     Returns keys [B, K, L] and log scores [B, K]. Gallery validity is deliberately
     checked afterwards, so invalid-key statistics measure the raw generator.
-    Every step rebuilds decoder inputs from the selected complete parent prefix.
+    Mamba evaluation prefills once and carries recurrent states in selected
+    parent order. ``use_cache=False`` retains full-prefix decoding as a reference;
+    decoders without a cache interface also use that path.
     """
     if beam_size < 1:
         raise ValueError('beam_size must be positive')
@@ -22,13 +25,20 @@ def beam_search(model, images: Tensor, beam_size: int = 8) -> tuple[Tensor, Tens
     batch = images.shape[0]
     keys = torch.empty(batch, 1, 0, dtype=torch.long, device=images.device)
     scores = torch.zeros(batch, 1, device=images.device)
-    for _ in range(model.levels):
+    cached = (use_cache and getattr(model, 'supports_cached_decoding', False)
+              and not getattr(model, 'training', False))
+    cache = None
+    for level in range(model.levels):
         width = keys.shape[1]
         expanded = prompts.unsqueeze(1).expand(batch, width, *prompts.shape[1:])
-        logits = model.next_logits(
-            expanded.reshape(batch * width, *prompts.shape[1:]),
-            memory, keys.reshape(batch * width, -1),
-        )
+        prompt_batch = expanded.reshape(batch * width, *prompts.shape[1:])
+        if cached and level == 0:
+            logits, cache = model.prefill_logits(prompts, memory)
+        elif cached:
+            logits = model.next_cached_logits(prompt_batch, memory,
+                                              keys[:, :, -1:].reshape(batch * width, 1), level, cache)
+        else:
+            logits = model.next_logits(prompt_batch, memory, keys.reshape(batch * width, -1))
         log_probs = F.log_softmax(logits.float(), dim=-1).reshape(batch, width, -1)
         vocab = log_probs.shape[-1]
         candidates = (scores.unsqueeze(-1) + log_probs).flatten(1)
@@ -36,6 +46,9 @@ def beam_search(model, images: Tensor, beam_size: int = 8) -> tuple[Tensor, Tens
         parents, tokens = selected // vocab, selected % vocab
         history = keys.gather(1, parents.unsqueeze(-1).expand(-1, -1, keys.shape[-1]))
         keys = torch.cat((history, tokens.unsqueeze(-1)), dim=-1)
+        if cached and level + 1 < model.levels:
+            offsets = torch.arange(batch, device=parents.device)[:, None] * width
+            model.reorder_cache(cache, (parents + offsets).flatten())
     return keys, scores
 
 

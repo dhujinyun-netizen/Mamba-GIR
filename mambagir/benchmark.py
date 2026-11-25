@@ -125,6 +125,8 @@ def measure_retrieval(model, images, gallery, beam_size=8, warmup=5, iterations=
         'identifier_length': levels, 'codebook_size': getattr(model, 'codebook_size', None),
         'queries_per_level': prompts_per_level, 'visual_prefix_tokens': prefix_tokens,
         'conditioning': conditioning, 'model_class': type(model).__name__,
+        'cached_decoding': bool(getattr(model, 'supports_cached_decoding', False)),
+        'lora_merged_for_inference': bool(getattr(getattr(model, 'decoder', None), 'inference_merged', False)),
         'num_gallery': len(gallery.codes), 'image_shape': list(images.shape),
         'parameter_counts': runtime.parameter_counts(model), 'batch_latency_ms': latency,
         'amortized_per_query_ms': {name: latency[name] / batch_size for name in ('mean', 'median', 'p95')},
@@ -169,12 +171,16 @@ def benchmark_checkpoint(checkpoint_path, manifest_path, output, device='cuda', 
     runtime.seed_everything(config['seed'])
     model = runtime.build_generator(config, tokenizer, device)
     runtime._restore_trainable(model, checkpoint['trainable_state'])
+    restored_parameter_counts = runtime.parameter_counts(model)
+    model.prepare_for_inference()
     dataset = ImageDataset(manifest.queries[:batch_size], train=False, **config['image'])
     images = torch.stack([dataset[index]['image'] for index in range(batch_size)]).to(device)
     gallery = GalleryIndex(tokenizer['target_codes'][manifest.gallery_indices])
     report = measure_retrieval(model, images, gallery, beam_size, warmup, iterations,
                                batch_size=batch_size, topk=max(config['evaluation']['ks']), amp=config['amp'])
     report.update(checkpoint=str(Path(checkpoint_path).expanduser().resolve()),
+                  parameter_counts=restored_parameter_counts,
+                  inference_parameter_counts=runtime.parameter_counts(model),
                   checkpoint_epoch=checkpoint.get('epoch'), tokenizer=str(Path(tokenizer_path).expanduser().resolve()),
                   tokenizer_id=tokenizer['artifact_id'], manifest=str(Path(manifest_path).expanduser().resolve()),
                   query_paths=[r.path for r in manifest.queries[:batch_size]], seed=config['seed'],

@@ -64,7 +64,7 @@ python -m mambagir train \
 
 The frozen encoder supplies 49 patches. CAVP produces 4 prompts per RVQ stage. Codebook memories enter both prompt refinement and the stage-aware head. Trainable components are CAVP, the head, the auxiliary classifier and rank-8 LoRA adapters in x_proj, in_proj, out_proj and embeddings. Same-label targets are sampled independently for every source per epoch, excluding self when another positive exists.
 
-Generator artifacts bind to the tokenizer used during training. last.pt is the final scheduled checkpoint; best.pt is chosen by training loss. Adapter-enabled Mamba uses an unfused forward path to preserve LoRA; decoding processes the prefix and generated history at each step.
+Generator artifacts bind to the tokenizer used during training. last.pt is the final scheduled checkpoint; best.pt is chosen by training loss. Training applies LoRA through the adapter modules.
 
 ## 4. Evaluate
 
@@ -75,6 +75,8 @@ python -m mambagir evaluate \
   --output runs/cub/seed3407/evaluation \
   --device cuda:0 --beam-size 8
 ~~~
+
+Evaluation restores the adapters and merges them into the decoder weights for inference. Mamba processes the visual prefix and SOS once, then carries convolution and SSM states while consuming one new token per step. Beam selection reorders and duplicates both state types with their parent hypotheses. The Python API supports `beam_search(..., use_cache=False)` for comparison with full-prefix decoding.
 
 Unconstrained beam search produces raw keys. Gallery resolution removes invalid keys, then expands every distinct valid key in fixed gallery-manifest order without image reranking. Outputs: metrics.json and predictions.pt.
 

@@ -160,6 +160,19 @@ class MambaGIR(nn.Module):
         self.encoder.eval()
         return self
 
+    @property
+    def supports_cached_decoding(self):
+        return all(callable(getattr(self.decoder, name, None))
+                   for name in ('prefill', 'decode_step', 'reorder_cache'))
+
+    def prepare_for_inference(self):
+        """Prepare the restored model for inference, merging Mamba's LoRA once."""
+        self.eval()
+        merge = getattr(self.decoder, 'merge_lora_for_inference', None)
+        if callable(merge):
+            merge()
+        return self
+
     def encode(self, images: Tensor) -> tuple[Tensor, Tensor]:
         with torch.no_grad():
             patches = self.encoder.forward_patches(images)
@@ -216,6 +229,26 @@ class MambaGIR(nn.Module):
         hidden = self.decoder(inputs)[:, -1:]
         return self._head(hidden, self._mean_prompts(prompts)[:, level:level + 1],
                           memory[level:level + 1], self.output_bias[level:level + 1])[:, 0]
+
+    def prefill_logits(self, prompts: Tensor, memory: Tensor):
+        empty = torch.empty(len(prompts), 0, dtype=torch.long, device=prompts.device)
+        inputs, _ = self._decoder_inputs(prompts, empty)
+        hidden, cache = self.decoder.prefill(inputs)
+        logits = self._head(hidden[:, -1:], self._mean_prompts(prompts)[:, :1],
+                            memory[:1], self.output_bias[:1])[:, 0]
+        return logits, cache
+
+    def next_cached_logits(self, prompts: Tensor, memory: Tensor,
+                           previous_codes: Tensor, level: int, cache) -> Tensor:
+        if not 1 <= level < self.levels or previous_codes.shape != (len(prompts), 1):
+            raise ValueError('cached prediction needs one preceding code and a level in [1,L)')
+        tokens = previous_codes + (level - 1) * self.codebook_size
+        hidden = self.decoder.decode_step(self.decoder.embed_tokens(tokens), cache)
+        return self._head(hidden, self._mean_prompts(prompts)[:, level:level+1],
+                          memory[level:level+1], self.output_bias[level:level+1])[:, 0]
+
+    def reorder_cache(self, cache, parents: Tensor):
+        self.decoder.reorder_cache(cache, parents)
 
     def forward(self, images: Tensor, target_codes: Tensor, labels: Tensor | None = None) -> dict[str, Tensor]:
         self._validate_codes(target_codes, images.shape[0], complete=True)

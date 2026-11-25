@@ -303,7 +303,8 @@ def evaluate(checkpoint_path, manifest_path, output_dir, device='cuda', *,
         raise ValueError('tokenizer artifact identity differs from the generator training checkpoint')
     model = build_generator(config, tokenizer, device)
     _restore_trainable(model, checkpoint['trainable_state'])
-    model.eval()
+    restored_parameter_counts = parameter_counts(model)
+    model.prepare_for_inference()
     settings = config['evaluation']
     beam_size = settings['beam_size'] if beam_size is None else beam_size
     ks = settings['ks'] if ks is None else ks
@@ -323,7 +324,9 @@ def evaluate(checkpoint_path, manifest_path, output_dir, device='cuda', *,
     report = retrieval_report(keys, ranks, gallery, [r.label for r in manifest.queries],
                               [manifest.targets[i].label for i in manifest.gallery_indices], ks)
     report.update(seed=config['seed'], checkpoint=str(Path(checkpoint_path).resolve()),
-                  checkpoint_epoch=checkpoint['epoch'], parameter_counts=parameter_counts(model))
+                  checkpoint_epoch=checkpoint['epoch'], parameter_counts=restored_parameter_counts,
+                  inference_parameter_counts=parameter_counts(model),
+                  cached_decoding=model.supports_cached_decoding)
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / 'metrics.json').write_text(json.dumps(report, indent=2, ensure_ascii=False) + '\n')

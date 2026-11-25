@@ -2,9 +2,9 @@
 
 The native LoRA wrappers keep all pretrained weights frozen. HF Mamba's CUDA
 fast path can consume projection weights directly and skip wrapper forwards;
-therefore adapter-enabled mixers use their own ``slow_forward`` method on both
-CPU and CUDA. This is a correctness choice with a throughput cost. It changes
-only those mixer instances, never the installed transformers package.
+therefore unmerged adapters use ``slow_forward`` during training. Evaluation
+can merge adapters into frozen weights and restore native CUDA dispatch.
+Prefill and single-token decoding carry the convolution and SSM states.
 """
 
 from __future__ import annotations
@@ -100,6 +100,7 @@ class MambaDecoder(nn.Module):
         self.backbone = backbone
         self.model_path = model_path
         self.adaptation = adaptation
+        self.inference_merged = False
         self.d_model = int(backbone.config.hidden_size)
         self.vocab_size = int(backbone.embeddings.num_embeddings)
         backbone.requires_grad_(False)
@@ -136,6 +137,79 @@ class MambaDecoder(nn.Module):
 
     def embed_tokens(self, ids: Tensor) -> Tensor:
         return self.backbone.embeddings(ids)
+
+    def train(self, mode: bool = True):
+        if mode and self.inference_merged:
+            raise RuntimeError('merged decoder is inference-only; load a fresh decoder for training')
+        return super().train(mode)
+
+    @torch.no_grad()
+    def merge_lora_for_inference(self):
+        """Permanently fold eval-mode adapters into weights, preserving logits.
+
+        Call after restoring the trained adapters. The training checkpoint stays
+        unchanged; this loaded instance becomes inference-only. Repeated calls
+        are harmless and never apply an update twice.
+        """
+        if self.training:
+            raise RuntimeError('call eval() before merging LoRA for inference')
+        if self.inference_merged:
+            return self
+        replacements = [(name, module) for name, module in self.backbone.named_modules()
+                        if isinstance(module, (LoRALinear, LoRAEmbedding))]
+        for name, module in replacements:
+            base = module.base_layer
+            with torch.autocast(base.weight.device.type, enabled=False):
+                if isinstance(module, LoRALinear):
+                    delta = module.lora_B.float() @ module.lora_A.float()
+                else:
+                    delta = module.lora_A.float() @ module.lora_B.float().T
+                base.weight.add_((module.scaling * delta).to(base.weight.dtype))
+            parent_name, _, child_name = name.rpartition('.')
+            parent = self.backbone.get_submodule(parent_name) if parent_name else self.backbone
+            setattr(parent, child_name, base)
+        if self.adapter_config['forced_slow_forward']:
+            for module in self.backbone.modules():
+                if callable(getattr(module, 'slow_forward', None)) and 'forward' in module.__dict__:
+                    del module.forward
+        self.inference_merged = True
+        self.adapter_config.update(merged_for_inference=True, forced_slow_forward=False)
+        return self
+
+    @torch.no_grad()
+    def prefill(self, inputs_embeds: Tensor):
+        """Process the visual prefix and SOS once and return their Mamba state."""
+        from transformers.cache_utils import MambaCache
+        dtype = (torch.get_autocast_gpu_dtype()
+                 if inputs_embeds.device.type == 'cuda' and torch.is_autocast_enabled()
+                 else inputs_embeds.dtype)
+        cache = MambaCache(self.backbone.config, inputs_embeds.shape[0],
+                           device=inputs_embeds.device, dtype=dtype)
+        # HF 4.53 uses this tiny position tensor for Python control flow. CPU
+        # positions avoid a GPU-to-CPU synchronization in each decoder layer.
+        position = torch.arange(self.backbone.config.conv_kernel, device='cpu')
+        output = self.backbone(inputs_embeds=inputs_embeds, cache_params=cache,
+                               cache_position=position, use_cache=True, return_dict=True)
+        return output.last_hidden_state, output.cache_params
+
+    @torch.no_grad()
+    def decode_step(self, inputs_embeds: Tensor, cache) -> Tensor:
+        """Consume one selected RVQ token using its parent's recurrent state."""
+        if inputs_embeds.ndim != 3 or inputs_embeds.shape[1] != 1:
+            raise ValueError('cached decoding expects one new token per hypothesis')
+        position = torch.tensor([self.backbone.config.conv_kernel], device='cpu')
+        output = self.backbone(inputs_embeds=inputs_embeds, cache_params=cache,
+                               cache_position=position, use_cache=True, return_dict=True)
+        return output.last_hidden_state
+
+    @staticmethod
+    def reorder_cache(cache, parents: Tensor):
+        """Copy selected parent states, including duplicate parents, in beam order."""
+        if parents.ndim != 1 or parents.dtype != torch.long:
+            raise ValueError('cache parents must be a one-dimensional long tensor')
+        cache.conv_states = [state.index_select(0, parents) for state in cache.conv_states]
+        cache.ssm_states = [state.index_select(0, parents) for state in cache.ssm_states]
+        cache.max_batch_size = len(parents)
 
     def forward(self, inputs_embeds: Tensor) -> Tensor:
         output = self.backbone(inputs_embeds=inputs_embeds, use_cache=False, return_dict=True)
