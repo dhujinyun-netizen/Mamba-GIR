@@ -20,7 +20,7 @@ VARIANTS = {
 
 
 class VisualEncoder(nn.Module):
-    def __init__(self, variant: str = 'L_21k', backbone: nn.Module | None = None):
+    def __init__(self, variant: str = 'B', backbone: nn.Module | None = None):
         super().__init__()
         if backbone is None:
             if variant not in VARIANTS:

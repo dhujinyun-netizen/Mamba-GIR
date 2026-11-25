@@ -18,7 +18,7 @@ class PretrainedTests(unittest.TestCase):
         from mambagir.vision import VisualEncoder
 
         torch.manual_seed(3407)
-        encoder = VisualEncoder('L_21k')
+        encoder = VisualEncoder(os.environ.get('MAMBAGIR_ENCODER_VARIANT', 'B'))
         encoder.load_pretrained(os.environ['MAMBAGIR_ENCODER_CHECKPOINT'])
         decoder = MambaDecoder(os.environ['MAMBAGIR_DECODER_PATH'])
         codebooks = torch.randn(4, 256, encoder.feature_dim)

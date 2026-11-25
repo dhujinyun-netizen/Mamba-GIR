@@ -3,7 +3,7 @@
   "workers": 4,
   "amp": true,
   "image": {"resize": 256, "crop": 224},
-  "vision": {"variant": "L_21k", "checkpoint": null},
+  "vision": {"variant": "B", "checkpoint": null},
   "rvq": {"levels": 4, "codebook_size": 256, "iterations": 25},
   "tokenizer": {
     "epochs": 200, "batch_size": 32, "head_depth": 12, "head_hidden_dim": null,

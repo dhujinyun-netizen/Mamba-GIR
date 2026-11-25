@@ -17,7 +17,7 @@ python -m mambagir --help
 
 The MambaVision selective-scan dependency needs a compatible CUDA environment. RVQ and LoRA modules are implemented in PyTorch. Main defaults are in configs/paper.json.
 
-Supply a checkpoint matching the selected MambaVision architecture and a local Hugging Face MambaModel directory. The default encoder is MambaVision L-21K; see the [upstream MambaVision project](https://github.com/NVlabs/MambaVision). Full-model parameter counts include the visual encoder, decoder, conditioning modules, and prediction heads. Each run records its configuration and actual total/trainable parameter counts.
+Supply a checkpoint matching the selected MambaVision architecture and a local Hugging Face MambaModel directory. The default encoder is MambaVision-B; see the [upstream MambaVision project](https://github.com/NVlabs/MambaVision). The 790M designation identifies the Mamba decoder variant. Full-model parameter counts include the visual encoder, decoder, conditioning modules, and prediction heads. Each run records its configuration and actual total/trainable parameter counts.
 
 ## 1. Prepare official splits
 
@@ -44,7 +44,7 @@ In-Shop gallery identity labels participate in tokenizer semantic supervision, p
 ~~~bash
 python -m mambagir train-tokenizer \
   --manifest data/cub.json \
-  --vision-checkpoint /weights/mambavision_large_21k.pth.tar \
+  --vision-checkpoint /weights/mambavision_base_21k.pth.tar \
   --output runs/cub/seed3407/tokenizer \
   --seed 3407 --device cuda:0
 ~~~
@@ -121,7 +121,7 @@ The export contains relative image paths, ordered gallery members for each ident
 python -m mambagir.reproduction --help
 CUB_ROOT=/datasets/CUB_200_2011 CARS_ROOT=/datasets/cars196 \
 AIRCRAFT_ROOT=/datasets/fgvc-aircraft-2013b INSHOP_ROOT=/datasets/InShop \
-VISION_CHECKPOINT=/weights/mambavision_large_21k.pth.tar \
+VISION_CHECKPOINT=/weights/mambavision_base_21k.pth.tar \
 MAMBA_MODEL=/weights/mamba-790m bash scripts/reproduce.sh plan
 ~~~
 
