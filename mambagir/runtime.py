@@ -12,7 +12,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from .data import ImageDataset, Manifest, sample_positive_indices
-from .retrieval import CUDAGraphBeamSearch, GalleryIndex, beam_search, retrieval_report
+from .retrieval import (CUDAGraphBeamSearch, GalleryIndex, beam_search, retrieval_report,
+                        gallery_prefix_tree, repair_nonfinite_beams)
 from .rvq import ResidualVectorQuantizer
 from .tokenizer import SemanticTokenizer
 from .vision import VisualEncoder
@@ -90,8 +91,12 @@ def _manifest_identity(manifest):
             'gallery_indices': list(manifest.gallery_indices)}
 
 
-def _check_identity(artifact, manifest):
-    for key, expected in _manifest_identity(manifest).items():
+def _check_identity(artifact, manifest, *, dataset_root=None):
+    identity = _manifest_identity(manifest)
+    if dataset_root is not None:
+        identity['target_paths'] = [Path(path).relative_to(dataset_root).as_posix()
+                                    for path in identity['target_paths']]
+    for key, expected in identity.items():
         if artifact.get(key) != expected:
             raise ValueError(f'{key} differs from tokenizer artifact; rebuild identifiers for this manifest')
 
@@ -170,20 +175,34 @@ def train_tokenizer(config, manifest_path, output_dir, device='cuda'):
     return path
 
 
-def _load_tokenizer(path, manifest):
+def _load_tokenizer(path, manifest, *, dataset_root=None):
     artifact = torch.load(path, map_location='cpu', weights_only=True)
-    if (artifact.get('kind') != 'mambagir_tokenizer' or artifact.get('format_version') != 1
+    if (artifact.get('kind') not in {'mambagir_tokenizer','mambagir_fixed_identifiers'} or artifact.get('format_version') != 1
             or not artifact.get('artifact_id')):
         raise ValueError('expected a clean-version tokenizer artifact (legacy .pkl is not interchangeable)')
-    _check_identity(artifact, manifest)
+    _check_identity(artifact, manifest, dataset_root=dataset_root)
     return artifact
 
 
-def build_generator(config, tokenizer, device):
+def build_generator(config, tokenizer, device, *, encoder_state=None):
     from .decoder import MambaDecoder, TransformerDecoder
     from .model import MambaGIR
-    encoder = VisualEncoder(tokenizer['config']['vision']['variant'])
-    encoder.load_state_dict(tokenizer['encoder_state'], strict=True)
+    encoder_source = config['generator'].get('encoder_source','tokenizer')
+    if encoder_state is not None:
+        encoder = VisualEncoder(config['vision']['variant'])
+        encoder.load_state_dict(encoder_state, strict=True)
+    elif encoder_source == 'pretrained':
+        encoder = VisualEncoder(config['vision']['variant'])
+        if not config['vision']['checkpoint']:
+            raise ValueError('independent query encoder requires vision.checkpoint')
+        encoder.load_pretrained(config['vision']['checkpoint'])
+    elif encoder_source == 'tokenizer':
+        if 'encoder_state' not in tokenizer:
+            raise ValueError('fixed identifier artifacts require an independent pretrained query encoder')
+        encoder = VisualEncoder(tokenizer['config']['vision']['variant'])
+        encoder.load_state_dict(tokenizer['encoder_state'], strict=True)
+    else:
+        raise ValueError(f'unknown generator encoder_source: {encoder_source}')
     decoder_config = config['decoder']
     if decoder_config['family'] == 'mamba':
         if not decoder_config['model_path']:
@@ -303,7 +322,7 @@ def evaluate(checkpoint_path, manifest_path, output_dir, device='cuda', *,
     tokenizer = _load_tokenizer(tokenizer_path, manifest)
     if tokenizer['artifact_id'] != checkpoint.get('tokenizer_id'):
         raise ValueError('tokenizer artifact identity differs from the generator training checkpoint')
-    model = build_generator(config, tokenizer, device)
+    model = build_generator(config, tokenizer, device, encoder_state=checkpoint.get('encoder_state'))
     _restore_trainable(model, checkpoint['trainable_state'])
     restored_parameter_counts = parameter_counts(model)
     model.prepare_for_inference()
@@ -314,20 +333,26 @@ def evaluate(checkpoint_path, manifest_path, output_dir, device='cuda', *,
         raise ValueError('ks must contain positive cutoffs')
     loader = _loader(manifest.queries, config, settings['batch_size'], False, device)
     gallery = GalleryIndex(tokenizer['target_codes'][manifest.gallery_indices])
+    prefix_tree = (gallery_prefix_tree(gallery.codes, device)
+                   if settings.get('gallery_prefix_tree', False) else None)
     all_keys, all_scores = [], []
     amp = config['amp'] and device.type == 'cuda'
-    runner, graph_queries = None, 0
+    runner, graph_queries, fallback_queries = None, 0, 0
     for batch in loader:
         images = batch['image'].to(device)
         if cuda_graph and runner is None:
-            runner = CUDAGraphBeamSearch(model, images, beam_size, amp=amp)
+            runner = CUDAGraphBeamSearch(model, images, beam_size, amp=amp, prefix_tree=prefix_tree)
         with torch.cuda.amp.autocast(enabled=amp):
             if runner is not None and images.shape == runner.images.shape:
                 keys, scores = runner(images)
                 graph_queries += len(images)
             else:
                 # A smaller final batch uses the same cached eager decoder.
-                keys, scores = beam_search(model, images, beam_size)
+                keys, scores = beam_search(model, images, beam_size, prefix_tree=prefix_tree)
+        if settings.get('nonfinite_fallback_dtype') == 'bfloat16':
+            keys, scores, repaired = repair_nonfinite_beams(model, images, keys, scores,
+                                                           prefix_tree=prefix_tree)
+            fallback_queries += repaired
         all_keys.append(keys.cpu())
         all_scores.append(scores.cpu())
     keys, scores = torch.cat(all_keys), torch.cat(all_scores)
@@ -338,6 +363,8 @@ def evaluate(checkpoint_path, manifest_path, output_dir, device='cuda', *,
                   checkpoint_epoch=checkpoint['epoch'], parameter_counts=restored_parameter_counts,
                   inference_parameter_counts=parameter_counts(model),
                   cached_decoding=model.supports_cached_decoding,
+                  search_policy='gallery_prefix_tree' if prefix_tree is not None else 'raw',
+                  nonfinite_fallback_queries=fallback_queries,
                   cuda_graph=bool(cuda_graph), cuda_graph_queries=graph_queries)
     output_dir = Path(output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)

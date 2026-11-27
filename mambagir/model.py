@@ -147,16 +147,17 @@ class MambaGIR(nn.Module):
         queries_per_level: int = 4, num_heads: int = 8, ffn_ratio: float = 2,
         dropout: float = .1, gamma_init: float = .1, alignment_temperature: float = .07,
         lambda_align: float = .05, lambda_cls: float = .1, conditioning: str = "cavp",
-        head_prompt_mode: str | None = None,
+        head_prompt_mode: str | None = None, independent_tokenizer: bool = False,
     ):
         super().__init__()
         if codebooks.ndim != 3 or min(codebooks.shape) < 1 or not codebooks.is_floating_point():
             raise ValueError("codebooks must be a nonempty floating tensor [levels, vocabulary, visual_dim]")
-        if codebooks.shape[-1] != encoder.feature_dim:
+        if codebooks.shape[-1] != encoder.feature_dim and not independent_tokenizer:
             raise ValueError("codebook feature dimension must match encoder.feature_dim")
         if num_classes < 1 or alignment_temperature <= 0 or min(lambda_align, lambda_cls) < 0:
             raise ValueError("num_classes and alignment_temperature must be positive; loss weights nonnegative")
-        self.levels, self.codebook_size, visual_dim = map(int, codebooks.shape)
+        self.levels, self.codebook_size, codebook_dim = map(int, codebooks.shape)
+        visual_dim = int(encoder.feature_dim)
         self.d_model = int(decoder.d_model)
         self.num_classes = num_classes
         self.queries_per_level = queries_per_level
@@ -175,8 +176,8 @@ class MambaGIR(nn.Module):
         self.cavp = CAVP(visual_dim, self.d_model, self.levels, self.codebook_size,
                          queries_per_level, num_heads, ffn_ratio, dropout, gamma_init, conditioning)
         if conditioning != "no_code_memory":
-            self.memory_norm = nn.LayerNorm(visual_dim)
-            self.memory_projection = nn.Linear(visual_dim, self.d_model, bias=False)
+            self.memory_norm = nn.LayerNorm(codebook_dim)
+            self.memory_projection = nn.Linear(codebook_dim, self.d_model, bias=False)
         self.prompt_projection = nn.Linear(self.d_model, self.d_model, bias=False)
         self.output_norm = nn.LayerNorm(self.d_model)
         self.output_projection = nn.Linear(self.d_model, self.d_model, bias=False)
@@ -300,14 +301,21 @@ class MambaGIR(nn.Module):
     def reorder_cache(self, cache, parents: Tensor):
         self.decoder.reorder_cache(cache, parents)
 
-    def forward(self, images: Tensor, target_codes: Tensor, labels: Tensor | None = None) -> dict[str, Tensor]:
+    def forward(self, images: Tensor, target_codes: Tensor, labels: Tensor | None = None,
+                *, cached_patches: bool = False) -> dict[str, Tensor]:
         self._validate_codes(target_codes, images.shape[0], complete=True)
         if labels is not None:
             if labels.dtype != torch.long or tuple(labels.shape) != (images.shape[0],):
                 raise ValueError("labels must be torch.long with shape [batch]")
             if labels.numel() and (labels.min() < 0 or labels.max() >= self.num_classes):
                 raise ValueError("labels must lie in [0, num_classes)")
-        prompts, memory = self.encode(images)
+        if cached_patches:
+            # Only the frozen visual encoder may be skipped during training.
+            # Both CAVP attentions, code memory, Mamba and every loss stay live.
+            memory = self._code_memory()
+            prompts = self.cavp(images, memory)
+        else:
+            prompts, memory = self.encode(images)
         # SOS predicts c_0; each later state consumes only codes from earlier stages.
         inputs, prefix_length = self._decoder_inputs(prompts, target_codes[:, :-1])
         hidden = self.decoder(inputs)[:, prefix_length:prefix_length + self.levels]

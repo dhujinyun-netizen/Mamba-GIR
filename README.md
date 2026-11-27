@@ -1,166 +1,101 @@
 # Mamba-GIR
 
-Research implementation of **Mamba-GIR: Structured Visual Conditioning and Identifier Modeling for Generative Image Retrieval**.
+Mamba-GIR uses residual vector quantization (RVQ) to assign fixed-gallery identifiers and codebook-aware visual prompting (CAVP) to condition a Mamba decoder on a query image. The repository contains dataset preparation, tokenizer training, generator training, evaluation and CAVP ablations.
 
-**Official splits → semantic tokenizer → residual vector quantization (RVQ) → fixed identifiers → CAVP-conditioned Mamba training → gallery retrieval.**
+## Released 790M checkpoints
 
-The repository provides source code, dataset split manifests, identifier-to-image mappings, configurations, and commands for training and evaluation.
+The release contains one MambaVision-B / Mamba-790M checkpoint per benchmark with its paired identifiers, gallery order, portable image manifest, saved raw beams and reference metrics. Download `mambagir-790m-metadata.tar.gz` and the `*_weights.pt` files for the datasets you want to evaluate. [GitHub release](https://github.com/dhujinyun-netizen/Mamba-GIR/releases/tag/repro-v1)
 
-## Environment
+Extract the metadata archive and place the downloaded weights beside `inference.json` in `artifacts/`. The archive's `metrics/` directory records the measurements from these checkpoints. Each dataset is represented by a single released checkpoint. The three-seed training commands below produce new independent results.
 
-Checked with Python 3.10, PyTorch 2.1.0 + CUDA 11.8, Transformers 4.53.0 and timm 1.0.12. Install CUDA-compatible PyTorch first:
+| Dataset | Queries | Gallery | R@1 (%) | R@4 (%) | R@8 (%) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| In-Shop | 14,218 | 12,612 | 85.62 | 86.68 | 88.18 |
+| CUB | 5,794 | 5,994 | 89.64 | 94.27 | 94.43 |
+| Cars196 | 8,041 | 8,144 | 92.02 | 95.83 | 95.90 |
+| FGVC-Aircraft | 3,333 | 6,667 | 89.38 | 95.35 | 95.44 |
+| Four-dataset mean | | | 89.17 | 93.03 | 93.49 |
 
-~~~bash
+### Recompute the measurements from the saved beams
+
+This step uses CPU PyTorch, NumPy and Pillow. It recomputes image recall, raw-key Hit@K and MRR, identifier validity, reuse and collision statistics directly from the released raw beams.
+
+```bash
+tar -xzf mambagir-790m-metadata.tar.gz
+for dataset in inshop cub cars aircraft; do
+  python -m mambagir.infer "$dataset" --artifacts artifacts --replay \
+    --output-dir "runs/replay/$dataset"
+done
+```
+
+### Run inference on the benchmark queries
+
+Install a CUDA-compatible build of PyTorch and torchvision first. The release was checked with Python 3.10, PyTorch 2.1.0 with CUDA 11.8, Transformers 4.53.0, timm 1.0.12, mamba-ssm 2.2.4 and causal-conv1d 1.5.0.post8. The released settings use CUDA graphs, BF16 for In-Shop, CUB and Aircraft, and FP32 with TF32 enabled for Cars.
+
+```bash
 python -m pip install -r requirements.txt
-python -m mambagir --help
-~~~
+python - <<'PY'
+from huggingface_hub import snapshot_download
+snapshot_download(
+    'state-spaces/mamba-790m-hf',
+    revision='9822dd4b76af2bd9099b6ce2f19efd8329189a7e',
+    allow_patterns=['config.json', 'model.safetensors'],
+    local_dir='weights/mamba-790m',
+)
+PY
 
-The MambaVision selective-scan dependency needs a compatible CUDA environment. RVQ and LoRA modules are implemented in PyTorch. Main defaults are in configs/paper.json.
+python -m mambagir.infer cub --artifacts artifacts \
+  --data-root /datasets/CUB_200_2011 --mamba-model weights/mamba-790m \
+  --output-dir runs/released/cub
+```
 
-Supply a checkpoint matching the selected MambaVision architecture and a local Hugging Face MambaModel directory. The default encoder is MambaVision-B; see the [upstream MambaVision project](https://github.com/NVlabs/MambaVision). The 790M designation identifies the Mamba decoder variant. Full-model parameter counts include the visual encoder, decoder, conditioning modules, and prediction heads. Each run records its configuration and actual total/trainable parameter counts.
+Point `--data-root` at the directory from which the paths in `artifacts/manifests/<dataset>.json` are relative. For example, the CUB root contains `images/`, Cars contains `images/cars_train/` and `images/cars_test/`, Aircraft contains `images/` and In-Shop contains `images/img/`. Each model loads its paired `<dataset>_identifiers.pt` and release manifest. The In-Shop inference manifest indexes the official gallery directly. Use `--image FILE` with the same model and dataset arguments to retrieve for custom queries. Benchmark inference writes `metrics.json` and `predictions.pt`.
 
-## 1. Prepare official splits
+## Train and evaluate
 
-Processed split manifests for the four benchmarks are in [manifests/](manifests/README.md). Each file specifies image paths, labels, training targets, gallery row indices, and queries. The following commands generate manifests for your local dataset layout:
+Use the original dataset images and official metadata. The processed training, gallery and query splits are in [manifests/](manifests/README.md). The released mappings are in `artifacts/mappings/`. Training exports its new identifiers and their ordered gallery members alongside each run.
 
-~~~bash
-python -m mambagir prepare-data --dataset cub --root /datasets/CUB_200_2011 --output data/cub.json
-python -m mambagir prepare-data --dataset cars --root /datasets/cars196 --output data/cars.json
-python -m mambagir prepare-data --dataset aircraft --root /datasets/fgvc-aircraft-2013b --output data/aircraft.json
-python -m mambagir prepare-data --dataset inshop --root /datasets/InShop --output data/inshop.json
-~~~
-
-| Dataset | Tokenizer/generator target pool | Searchable gallery | Held-out queries |
-|---|---:|---:|---:|
-| CUB | 5,994 train | 5,994 train | 5,794 test |
-| Cars | 8,144 train | 8,144 train | 8,041 test |
-| Aircraft | 6,667 train + validation | 6,667 train + validation | 3,333 test |
+| Dataset | Tokenizer and generator target pool | Searchable gallery | Evaluation queries |
+| --- | ---: | ---: | ---: |
 | In-Shop | 25,882 train + 12,612 gallery | 12,612 gallery | 14,218 query |
+| CUB | 5,994 train | 5,994 train | 5,794 test |
+| Cars196 | 8,144 train | 8,144 train | 8,041 test |
+| FGVC-Aircraft | 6,667 train + validation | 6,667 train + validation | 3,333 test |
 
-In-Shop gallery identity labels participate in tokenizer semantic supervision, positive-pair sampling and the generator's auxiliary class loss. Query images are held out. Images are resized to 256 × 256, then randomly cropped/flipped in training or center-cropped to 224 × 224 during evaluation, using ImageNet normalization.
+The In-Shop gallery labels are used for tokenizer supervision, same-identity pairing and the auxiliary class loss. The held-out query split is used during evaluation. `configs/paper.json` specifies the 200-epoch tokenizer, 400-epoch generator, four RVQ stages, 256 codewords per stage and the default conditioning and decoding settings. Supply the official MambaVision-B-21K `mambavision_base_21k.pth.tar` and the local pretrained Mamba directory. [MambaVision-B-21K checkpoint](https://huggingface.co/nvidia/MambaVision-B-21K/resolve/bfe552a588f9f250ea0583951ea4dd5a10a198f8/mambavision_base_21k.pth.tar)
 
-## 2. Train the tokenizer and construct identifiers
+```bash
+export CUB_ROOT=/datasets/CUB_200_2011 CARS_ROOT=/datasets/cars196
+export AIRCRAFT_ROOT=/datasets/fgvc-aircraft-2013b INSHOP_ROOT=/datasets/InShop
+export VISION_CHECKPOINT=/weights/mambavision_base_21k.pth.tar
+export MAMBA_MODEL="$PWD/weights/mamba-790m"
+export RUN_ROOT=runs/reproduction-main
+bash scripts/reproduce.sh plan
+bash scripts/reproduce.sh run
+```
 
-~~~bash
-python -m mambagir train-tokenizer \
-  --manifest data/cub.json \
-  --vision-checkpoint /weights/mambavision_base_21k.pth.tar \
-  --output runs/cub/seed3407/tokenizer \
-  --seed 3407 --device cuda:0
-~~~
+The first command prints the plan. The second prepares all four splits, trains tokenizer and generator for seeds 3407, 3408 and 3409, evaluates the final configured epoch and aggregates means and sample standard deviations. For individual stages and overrides, use `python -m mambagir --help`. Runs record their configuration and parameter counts. Evaluation records per-run recall, raw-key and collision statistics and the raw beam outputs. To repeat a different decoder scale, use a matching pretrained model directory and a distinct `RUN_ROOT`.
 
-This trains the semantic encoder/head and alternates deterministic feature extraction with residual codebook fitting. The exported tokenizer.pt contains the final encoder, frozen codebooks, target identifiers, labels, gallery indices and a unique tokenizer identity. Defaults: 4 RVQ stages, 256 codewords per stage. Supply trusted pretrained files: legacy NVIDIA training metadata requires the original PyTorch loader.
+### CAVP ablations
 
-## 3. Train the generator
+Use the same tokenizer and image roles per dataset and seed. The ablation script generates explicit configurations for the ten conditioning controls, trains each variant, evaluates the four datasets and summarizes per-dataset and equal-weight macro recall.
 
-~~~bash
-python -m mambagir train \
-  --manifest data/cub.json \
-  --tokenizer runs/cub/seed3407/tokenizer/tokenizer.pt \
-  --mamba-model /weights/mamba-790m \
-  --output runs/cub/seed3407/generator \
-  --seed 3407 --device cuda:0
-~~~
+```bash
+python scripts/reproduce_ablations.py --run-root "$RUN_ROOT" \
+  --mamba-model "$MAMBA_MODEL" --output runs/ablation-790m
+```
 
-The frozen encoder supplies 49 patches. CAVP produces 4 prompts per RVQ stage. Codebook memories enter both prompt refinement and the stage-aware head. Trainable components are CAVP, the head, the auxiliary classifier and rank-8 LoRA adapters in x_proj, in_proj, out_proj and embeddings. Same-label targets are sampled independently for every source per epoch, excluding self when another positive exists.
+Add `--execute` to run the plan. Use `--variants patch_attention levelwise full_cavp` to run the two core comparisons. Generic patch attention uses a common head and alignment summary. Level-wise prompting selects the matching stage summary while keeping the same prediction memory. Full CAVP adds prompt-to-codebook attention. The no-code-memory control removes that attention and uses decoder embeddings for prediction and alignment.
 
-Generator artifacts bind to the tokenizer used during training. last.pt is the final scheduled checkpoint; best.pt is chosen by training loss. Training applies LoRA through the adapter modules.
+### Additional evaluation commands
 
-## 4. Evaluate
+- `python -m mambagir.reproduction --help` exports portable splits and paired key mappings from a trained tokenizer.
+- `python -m mambagir.diagnostics --help` computes raw-key and ranking diagnostics from saved training-workflow predictions.
+- `python -m mambagir.benchmark --help` profiles latency and peak memory for a training-workflow checkpoint.
+- `python -m unittest discover -s tests -v` runs the implementation checks.
 
-~~~bash
-python -m mambagir evaluate \
-  --checkpoint runs/cub/seed3407/generator/last.pt \
-  --manifest data/cub.json \
-  --output runs/cub/seed3407/evaluation \
-  --device cuda:0 --beam-size 8
-~~~
+The release and the training recipes specify their own measurements. Exact reproduction of earlier reported table entries requires the corresponding per-run configurations, checkpoints or raw predictions. The reference Transformer implementation is available through `decoder.family=transformer`. Refer to the original IRGen and Diff-IR publications for their results and protocols. [IRGen code](https://github.com/yakt00/IRGen)
 
-Evaluation restores the adapters and merges them into the decoder weights for inference. Mamba processes the visual prefix and SOS once, then carries convolution and SSM states while consuming one new token per step. Beam selection reorders and duplicates both state types with their parent hypotheses. The Python API supports `beam_search(..., use_cache=False)` for comparison with full-prefix decoding.
+## Licenses
 
-Add `--cuda-graph` to CUDA evaluation to replay the complete encoding and beam-search computation with fixed tensor shapes. The runner precomputes the fixed codebook memory and its attention K/V projections once. Each query still computes its own visual features, prompts and decoder states. A smaller final evaluation batch uses the cached eager path. The Python `CUDAGraphBeamSearch(model, example_images, beam_size=8, amp=False)` interface provides the same reusable runner after `model.prepare_for_inference()`; create a new runner after changing model weights, precision or input shape.
-
-Unconstrained beam search produces raw keys. Gallery resolution removes invalid keys, then expands every distinct valid key in fixed gallery-manifest order without image reranking. Outputs: metrics.json and predictions.pt.
-
-The report includes image Recall@K, raw-key Hit@K/MRR, validity, query reuse, gallery collisions, and a within-bucket ordering diagnostic. Raw-key Hit@K/MRR retain invalid candidates at their original beam positions. A key is relevant when at least one of its gallery members has the query label; MRR assigns zero when no relevant key occurs in the beam.
-
-Export aggregate raw-ranking metrics and the candidate-level records from a saved evaluation:
-
-~~~bash
-python -m mambagir.diagnostics \
-  --predictions runs/cub/seed3407/evaluation/predictions.pt \
-  --tokenizer runs/cub/seed3407/tokenizer/tokenizer.pt \
-  --manifest data/cub.json \
-  --output-dir runs/cub/seed3407/evaluation/diagnostics
-~~~
-
-Measure query latency and peak GPU memory for a trained configuration:
-
-~~~bash
-python -m mambagir.benchmark \
-  --checkpoint runs/cub/seed3407/generator/last.pt \
-  --manifest data/cub.json \
-  --output runs/cub/seed3407/timing.json \
-  --device cuda:0 --batch-size 1 --beam-size 8 \
-  --warmup 20 --iterations 100
-~~~
-
-Timing covers a resident query batch through visual encoding, conditioning, beam decoding, and gallery resolution. The JSON report records the GPU, precision, warm-up and measured iterations, CUDA-synchronized latency samples, and peak allocated/reserved GPU memory. Image preprocessing and input transfer precede the timed interval.
-
-The benchmark also accepts `--cuda-graph`. Graph preparation occurs once before timed queries and is reported separately as `cuda_graph_setup_ms`; query latency includes input-buffer copying, graph replay, and gallery resolution. Both evaluation and timing retain the checkpoint configuration's autocast setting.
-
-## 5. Export a retrieval index
-
-Released gallery mappings for all four benchmarks are available in [identifiers/](identifiers/README.md), paired with the corresponding [split manifests](manifests/README.md). Each mapping contains the four-symbol identifier and every gallery image assigned to it, including the image path, label, target row, and gallery row. Members of a shared identifier retain their gallery order. Use each assignment with the generator trained on those identifiers.
-
-Export the gallery lookup and dataset manifest for a trained tokenizer with:
-
-~~~bash
-python -m mambagir.reproduction export \
-  --manifest data/cub.json \
-  --tokenizer runs/cub/seed3407/tokenizer/tokenizer.pt \
-  --dataset-root /datasets/CUB_200_2011 \
-  --output runs/cub/seed3407/export
-~~~
-
-The export contains relative image paths, ordered gallery members for each identifier, and the tokenizer configuration. The reproduction script provides commands for all four datasets:
-
-~~~bash
-python -m mambagir.reproduction --help
-CUB_ROOT=/datasets/CUB_200_2011 CARS_ROOT=/datasets/cars196 \
-AIRCRAFT_ROOT=/datasets/fgvc-aircraft-2013b INSHOP_ROOT=/datasets/InShop \
-VISION_CHECKPOINT=/weights/mambavision_base_21k.pth.tar \
-MAMBA_MODEL=/weights/mamba-790m bash scripts/reproduce.sh plan
-~~~
-
-The script provides a four-dataset, three-seed command plan. Its default prints commands before optional execution.
-
-## Main files
-
-| File | Purpose |
-|---|---|
-| mambagir/data.py | Splits, preprocessing and positive targets |
-| mambagir/tokenizer.py, rvq.py | Semantic objective and residual quantization |
-| mambagir/vision.py, _mambavision.py | Global/spatial encoder features |
-| mambagir/model.py | CAVP, stage-aware head and losses |
-| mambagir/decoder.py | Mamba LoRA and causal Transformer reference |
-| mambagir/retrieval.py | Beam search, gallery resolution and metrics |
-| mambagir/runtime.py, __main__.py | Training, evaluation and artifacts |
-| mambagir/reproduction.py | Portable manifests and key mappings |
-| mambagir/diagnostics.py | Saved raw candidates and ranking diagnostics |
-| mambagir/benchmark.py | Query latency and GPU memory measurements |
-
-Generic patch controls use a shared prompt mean in the prediction/alignment paths; level-wise controls use the matching stage mean. Full CAVP remains stage-aware. The no_code_memory control removes both prompt code attention and RVQ vectors from head/alignment memory.
-
-## Verification
-
-~~~bash
-PYTHONDONTWRITEBYTECODE=1 USE_TF=0 MKL_THREADING_LAYER=GNU \
-  OMP_NUM_THREADS=2 python -m unittest discover -s tests -v
-~~~
-
-Tests cover formulas, active LoRA gradients, causality, data roles, tokenizer identity, beam ancestry, invalid raw positions, collision ordering and a small training-to-retrieval path. Full pretrained integration is opt-in via MAMBAGIR_ENCODER_CHECKPOINT and MAMBAGIR_DECODER_PATH.
-
-## License
-
-Original Mamba-GIR code is MIT licensed. The extracted MambaVision architecture retains NVIDIA's Source Code License-NC and its research/evaluation-only use limitation; see NOTICE and licenses/NVIDIA-MambaVision.txt. Datasets, weights and external dependencies retain their respective terms.
+Original Mamba-GIR code is MIT licensed. The extracted MambaVision architecture retains the NVIDIA Source Code License-NC. The released visual encoder states are derived from the NVIDIA MambaVision-B-21K pretrained weights under their upstream CC BY-NC-SA 4.0 terms. See [NOTICE](NOTICE) for attribution. Dataset images are obtained from their original sources. [MambaVision licensing](https://github.com/NVlabs/MambaVision#licenses)

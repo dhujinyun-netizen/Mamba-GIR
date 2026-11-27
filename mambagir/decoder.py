@@ -10,6 +10,7 @@ Prefill and single-token decoding carry the convolution and SSM states.
 from __future__ import annotations
 
 import math
+import types
 
 import torch
 from torch import Tensor, nn
@@ -63,6 +64,24 @@ class LoRAEmbedding(nn.Module):
         rank_features = F.embedding(ids, self.lora_A)
         update = F.linear(self.dropout(rank_features), self.lora_B)
         return self.base_layer(ids) + self.scaling * update
+
+
+def _cuda_lora_forward(mixer, hidden_states, cache_params=None, cache_position=None,
+                       attention_mask=None):
+    """Use differentiable CUDA scan without the fused path that skips LoRA.
+
+    The native nonfused CUDA branch calls the projection modules, including
+    their adapters and dropout. Only this mixer's dispatch flag is temporary;
+    its child modules retain their training flags and autograd stays enabled.
+    """
+    training = mixer.training
+    try:
+        mixer.training = False
+        return mixer.cuda_kernels_forward(hidden_states, cache_params=cache_params,
+                                           cache_position=cache_position,
+                                           attention_mask=attention_mask)
+    finally:
+        mixer.training = training
 
 
 class MambaDecoder(nn.Module):
@@ -137,6 +156,22 @@ class MambaDecoder(nn.Module):
 
     def embed_tokens(self, ids: Tensor) -> Tensor:
         return self.backbone.embeddings(ids)
+
+    def enable_fast_lora_training(self):
+        """Opt into CUDA projection/scan autograd while keeping all adapters active."""
+        if self.inference_merged or self.adaptation != 'lora':
+            raise ValueError('fast LoRA training needs unmerged trainable adapters')
+        from transformers.models.mamba.modeling_mamba import is_fast_path_available
+        if not is_fast_path_available:
+            raise RuntimeError('fast LoRA training requires causal-conv1d and mamba-ssm CUDA kernels')
+        mixers = [module for module in self.backbone.modules()
+                  if callable(getattr(module, 'cuda_kernels_forward', None))]
+        if not mixers:
+            raise RuntimeError('no native CUDA Mamba mixers found')
+        for mixer in mixers:
+            mixer.forward = types.MethodType(_cuda_lora_forward, mixer)
+        self.adapter_config.update(training_backend='cuda_unfused', forced_slow_forward=False)
+        return self
 
     def train(self, mode: bool = True):
         if mode and self.inference_merged:

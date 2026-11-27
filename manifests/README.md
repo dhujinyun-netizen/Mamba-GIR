@@ -17,9 +17,9 @@ Place the chosen manifest at the root matching the path layout above, then pass 
 cp manifests/cub.json /datasets/CUB_200_2011/retrieval_manifest.json
 python -m mambagir train-tokenizer \
   --manifest /datasets/CUB_200_2011/retrieval_manifest.json \
-  --vision-checkpoint /weights/mambavision_large_21k.pth.tar \
+  --vision-checkpoint /weights/mambavision_base_21k.pth.tar \
   --output runs/cub/seed3407/tokenizer \
   --seed 3407 --device cuda:0
 ```
 
-The `prepare-data` commands in the main README construct manifests directly for a local dataset layout. After tokenizer training, `python -m mambagir.reproduction export` exports the identifier-to-image mapping in gallery order together with the corresponding manifest.
+`python -m mambagir prepare-data --help` describes how to construct a manifest from a local dataset layout. After tokenizer training, `python -m mambagir.reproduction export` exports the identifier-to-image mapping in gallery order with its manifest. The released weights use the manifests and mappings in the paired release archive.

@@ -231,11 +231,24 @@ def prepare_manifest(dataset: str, root: str) -> Manifest:
 
 
 class ImageDataset(Dataset):
-    def __init__(self, records: Sequence[Record], train=False, resize=256, crop=224):
+    def __init__(self, records: Sequence[Record], train=False, resize=256, crop=224,
+                 profile='paper'):
         if crop <= 0 or resize < crop:
             raise ValueError("Image sizes must satisfy resize >= crop > 0")
         self.records = list(records)
         self.train, self.resize, self.crop = train, int(resize), int(crop)
+        if profile not in {'paper', 'legacy_clip'}:
+            raise ValueError('unknown image preprocessing profile')
+        self.legacy_transform = None
+        if profile == 'legacy_clip':
+            from torchvision import transforms
+            operations = [transforms.Resize(resize, interpolation=3),
+                          transforms.RandomCrop(crop) if train else transforms.CenterCrop(crop)]
+            if train:
+                operations.append(transforms.RandomHorizontalFlip())
+            operations.extend([transforms.ToTensor(), transforms.Normalize(
+                (.48145466, .4578275, .40821073), (.26862954, .26130258, .27577711))])
+            self.legacy_transform = transforms.Compose(operations)
         self.mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
         self.std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
@@ -245,6 +258,9 @@ class ImageDataset(Dataset):
     def __getitem__(self, index):
         record = self.records[index]
         with Image.open(record.path) as source:
+            if self.legacy_transform is not None:
+                return {'image': self.legacy_transform(source.convert('RGB')),
+                        'label': torch.tensor(record.label, dtype=torch.long), 'index': int(index)}
             image = source.convert("RGB").resize((self.resize, self.resize), Image.Resampling.BILINEAR)
         margin = self.resize - self.crop
         if self.train:

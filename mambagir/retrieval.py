@@ -10,9 +10,31 @@ from torch import Tensor
 from torch.nn import functional as F
 
 
+def gallery_prefix_tree(codes: Tensor, device) -> list[Tensor]:
+    """Gallery-only transitions; invalid extensions retain probability zero."""
+    codes = torch.as_tensor(codes, dtype=torch.long, device='cpu')
+    if codes.ndim != 2 or not len(codes) or bool((codes < 0).any()):
+        raise ValueError('expected nonnegative gallery codes [N,L]')
+    vocabulary = max(256, int(codes.max())+1)
+    prefixes = {(): 0}
+    result = []
+    for level in range(codes.shape[1]):
+        following = {}
+        transition = torch.full((len(prefixes), vocabulary), -1, dtype=torch.long)
+        for row in codes.tolist():
+            previous, current = tuple(row[:level]), tuple(row[:level+1])
+            if current not in following:
+                following[current] = len(following)
+            transition[prefixes[previous], row[level]] = following[current]
+        result.append(transition.to(device))
+        prefixes = following
+    return result
+
+
 @torch.no_grad()
 def beam_search(model, images: Tensor, beam_size: int = 8, *,
-                use_cache: bool = True, conditioning_cache=None) -> tuple[Tensor, Tensor]:
+                use_cache: bool = True, conditioning_cache=None,
+                prefix_tree=None) -> tuple[Tensor, Tensor]:
     """Generate unconstrained fixed-length keys, ranked by summed log probability.
 
     Returns keys [B, K, L] and log scores [B, K]. Gallery validity is deliberately
@@ -28,6 +50,7 @@ def beam_search(model, images: Tensor, beam_size: int = 8, *,
     batch = images.shape[0]
     keys = torch.empty(batch, 1, 0, dtype=torch.long, device=images.device)
     scores = torch.zeros(batch, 1, device=images.device)
+    nodes = torch.zeros(batch, 1, dtype=torch.long, device=images.device)
     cached = (use_cache and getattr(model, 'supports_cached_decoding', False)
               and not getattr(model, 'training', False))
     cache = None
@@ -44,15 +67,41 @@ def beam_search(model, images: Tensor, beam_size: int = 8, *,
             logits = model.next_logits(prompt_batch, memory, keys.reshape(batch * width, -1))
         log_probs = F.log_softmax(logits.float(), dim=-1).reshape(batch, width, -1)
         vocab = log_probs.shape[-1]
+        if prefix_tree is not None:
+            transitions = prefix_tree[level][nodes, :vocab]
+            log_probs = log_probs.masked_fill(transitions < 0, -torch.inf)
         candidates = (scores.unsqueeze(-1) + log_probs).flatten(1)
         scores, selected = candidates.topk(min(beam_size, candidates.shape[1]), dim=1)
         parents, tokens = selected // vocab, selected % vocab
+        if prefix_tree is not None:
+            nodes = transitions.gather(1, parents[..., None].expand(-1, -1, vocab))
+            nodes = nodes.gather(2, tokens[..., None]).squeeze(-1).clamp_min(0)
         history = keys.gather(1, parents.unsqueeze(-1).expand(-1, -1, keys.shape[-1]))
         keys = torch.cat((history, tokens.unsqueeze(-1)), dim=-1)
         if cached and level + 1 < model.levels:
             offsets = torch.arange(batch, device=parents.device)[:, None] * width
             model.reorder_cache(cache, (parents + offsets).flatten())
     return keys, scores
+
+
+@torch.no_grad()
+def repair_nonfinite_beams(model, images, keys, scores, *, prefix_tree=None):
+    """Retry numerically invalid rows in BF16, preserving every finite row.
+
+    Negative-infinity padding for small constrained galleries is legitimate.
+    Retry decisions depend only on numerical validity, never query labels.
+    """
+    bad = (torch.isnan(scores) | torch.isposinf(scores)).any(dim=1)
+    count = int(bad.sum())
+    if not count:
+        return keys, scores, 0
+    with torch.autocast(images.device.type, dtype=torch.bfloat16,
+                        enabled=images.device.type == 'cuda', cache_enabled=False):
+        replacement, values = beam_search(model, images, keys.shape[1], prefix_tree=prefix_tree)
+    if bool((torch.isnan(values[bad]) | torch.isposinf(values[bad])).any()):
+        raise FloatingPointError('BF16 retry also produced nonfinite beam scores')
+    return (torch.where(bad[:, None, None], replacement, keys),
+            torch.where(bad[:, None], values, scores), count)
 
 
 class CUDAGraphBeamSearch:
@@ -67,7 +116,7 @@ class CUDAGraphBeamSearch:
 
     @torch.inference_mode()
     def __init__(self, model, example_images: Tensor, beam_size: int = 8, *,
-                 amp: bool = False, warmup: int = 3):
+                 amp: bool = False, warmup: int = 3, prefix_tree=None):
         if example_images.device.type != 'cuda':
             raise ValueError('CUDA graph inference requires CUDA query tensors')
         if (model.training or not getattr(model, 'supports_cached_decoding', False)
@@ -90,13 +139,15 @@ class CUDAGraphBeamSearch:
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 for _ in range(warmup):
-                    beam_search(model, self.images, beam_size, conditioning_cache=self.conditioning_cache)
+                    beam_search(model, self.images, beam_size, conditioning_cache=self.conditioning_cache,
+                                prefix_tree=prefix_tree)
             torch.cuda.current_stream().wait_stream(stream)
             torch.cuda.synchronize(example_images.device)
             self.graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(self.graph, stream=stream):
                 self.keys, self.scores = beam_search(model, self.images, beam_size,
-                                                    conditioning_cache=self.conditioning_cache)
+                                                    conditioning_cache=self.conditioning_cache,
+                                                    prefix_tree=prefix_tree)
             torch.cuda.synchronize(example_images.device)
         self.setup_ms = (time.perf_counter() - started) * 1000
 
